@@ -1,3 +1,0 @@
-mysql-connector-python>=8.0.26
-tabulate>=0.8.9
-python-dotenv>=1.0
