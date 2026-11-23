@@ -3,11 +3,47 @@ from mysql.connector import Error
 from tabulate import tabulate
 from datetime import datetime
 import sys
-from db_config import (
-    DB_CONFIG, create_connection, initialize_database, execute_query,
-    call_stored_procedure, get_employee_summary,
-    promote_employee_db, search_employees_db
-)
+import math
+import re
+from pathlib import Path
+from db_config import DB_CONFIG
+
+DEPT_PREFIX = {
+    'Finance': '1',
+    'IT': '2',
+    'Marketing': '3',
+    'Sales': '4',
+    'HR': '5'
+}
+
+def sql_str(v):
+    return "'" + str(v).replace("\\", "\\\\").replace("'", "''") + "'"
+
+EMPLOYEE_SELECT = """
+    SELECT
+        id, first_name, last_name, email, phone, department,
+        position,
+        CONCAT('$', FORMAT(salary, 2)) as salary,
+        DATE_FORMAT(hire_date, '%Y-%m-%d') as hire_date
+    FROM employees
+"""
+
+EMPLOYEE_HEADERS = [
+    "ID", "First Name", "Last Name", "Email", "Phone",
+    "Department", "Position", "Salary", "Hire Date"
+]
+
+def print_employees(rows):
+    print(tabulate(
+        rows,
+        headers=EMPLOYEE_HEADERS,
+        tablefmt="grid",
+        colalign=(
+            "center", "left", "left", "left", "center",
+            "left", "left", "right", "center"
+        ),
+        numalign="center"
+    ))
 
 class EmployeeManagement:
     def __init__(self):
@@ -32,28 +68,28 @@ class EmployeeManagement:
             self.connection.close()
             print("Database connection closed.")
 
-    def __del__(self):
-        self.close_connection()
-
     def execute_query(self, query, params=None):
+        cursor = None
         try:
             cursor = self.connection.cursor()
             if params:
                 cursor.execute(query, params)
             else:
                 cursor.execute(query)
-            
             if query.strip().upper().startswith('SELECT'):
-                result = cursor.fetchall()
-                cursor.close()
-                return result
-            else:
-                self.connection.commit()
-                cursor.close()
-                return True
+                return cursor.fetchall()
+            self.connection.commit()
+            return True
         except Error as e:
             print(f"Error executing query: {e}")
             return None
+        finally:
+            if cursor:
+                cursor.close()
+
+    def fetch_employee(self, emp_id):
+        query = EMPLOYEE_SELECT + " WHERE id = %s"
+        return self.execute_query(query, (emp_id,))
 
     def add_employee(self):
         try:
@@ -61,8 +97,7 @@ class EmployeeManagement:
             
             # Get department first to determine ID prefix
             print("\nAvailable Departments:")
-            dept_query = "SELECT DISTINCT department FROM employees ORDER BY department"
-            departments = self.execute_query(dept_query)
+            departments = [(dept,) for dept in sorted(DEPT_PREFIX)]
             for i, dept in enumerate(departments, 1):
                 print(f"{i}. {dept[0]}")
             
@@ -78,13 +113,10 @@ class EmployeeManagement:
                     print("Please enter a valid number.")
             
             # Get the next available ID for the selected department
-            dept_prefix = {
-                'Finance': '1',
-                'IT': '2',
-                'Marketing': '3',
-                'Sales': '4',
-                'HR': '5'
-            }[department]
+            dept_prefix = DEPT_PREFIX.get(department)
+            if dept_prefix is None:
+                print("Invalid department selected.")
+                return
             
             # Get the highest ID for this department
             id_query = f"""
@@ -92,30 +124,44 @@ class EmployeeManagement:
                 FROM employees
                 WHERE id LIKE '{dept_prefix}%'
             """
-            max_id = self.execute_query(id_query)[0][0]
+            rows = self.execute_query(id_query)
+            if rows is None:
+                print("Could not determine the next ID.")
+                return
+            max_id = rows[0][0]
+            if max_id and max_id >= 99:
+                print("Department ID range is full.")
+                return
             new_id = f"{dept_prefix}{str(max_id + 1).zfill(2)}" if max_id else f"{dept_prefix}01"
             
             # Get employee details
             first_name = input("Enter first name: ").strip()
             last_name = input("Enter last name: ").strip()
+            position = input("Enter position: ").strip()
+            
+            if not (first_name and last_name and position):
+                print("All fields are required.")
+                return
             
             # Generate email
-            email = f"{first_name[0].lower()}.{last_name.lower()}@company.com"
+            first_clean = re.sub(r"[^a-z0-9]", "", first_name.lower())
+            last_clean = re.sub(r"[^a-z0-9]", "", last_name.lower())
+            if not (first_clean and last_clean):
+                print("Names must contain at least one letter A-Z or digit.")
+                return
+            email = f"{first_clean[0]}.{last_clean}@company.com"
             
             # Generate phone number
             phone = f"555-555-{new_id}"
-            
-            # Get position manually
-            position = input("Enter position: ").strip()
             
             # Get salary
             while True:
                 try:
                     salary = float(input("Enter salary: $"))
-                    if salary > 0:
+                    if 0 < salary < 100_000_000 and math.isfinite(salary):
                         break
                     else:
-                        print("Salary must be greater than 0.")
+                        print("Salary must be greater than 0 and less than $100,000,000.")
                 except ValueError:
                     print("Please enter a valid number.")
             
@@ -248,18 +294,7 @@ class EmployeeManagement:
             print("\n=== Search Employee ===")
             search_term = input("Enter search term (ID, name, email, or department): ").strip()
             
-            query = """
-                SELECT 
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone,
-                    department,
-                    position,
-                    CONCAT('$', FORMAT(salary, 2)) as salary,
-                    DATE_FORMAT(hire_date, '%Y-%m-%d') as hire_date
-                FROM employees
+            query = EMPLOYEE_SELECT + """
                 WHERE id LIKE %s
                 OR first_name LIKE %s
                 OR last_name LIKE %s
@@ -275,27 +310,7 @@ class EmployeeManagement:
             ))
             
             if results:
-                headers = [
-                    "ID", "First Name", "Last Name", "Email", "Phone",
-                    "Department", "Position", "Salary", "Hire Date"
-                ]
-                print(tabulate(
-                    results,
-                    headers=headers,
-                    tablefmt="grid",
-                    colalign=(
-                        "center",  # ID
-                        "left",    # First Name
-                        "left",    # Last Name
-                        "left",    # Email
-                        "center",  # Phone
-                        "left",    # Department
-                        "left",    # Position
-                        "right",   # Salary
-                        "center"   # Hire Date
-                    ),
-                    numalign="center"
-                ))
+                print_employees(results)
                 print(f"\nFound {len(results)} employee(s)")
             else:
                 print("No employees found matching the search term.")
@@ -308,48 +323,14 @@ class EmployeeManagement:
             emp_id = input("Enter employee ID to update: ").strip()
             
             # First check if employee exists
-            check_query = """
-                SELECT 
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone,
-                    department,
-                    position,
-                    CONCAT('$', FORMAT(salary, 2)) as salary,
-                    DATE_FORMAT(hire_date, '%Y-%m-%d') as hire_date
-                FROM employees 
-                WHERE id = %s
-            """
-            employee = self.execute_query(check_query, (emp_id,))
+            employee = self.fetch_employee(emp_id)
             
             if not employee:
                 print("Employee not found!")
                 return
             
             print("\nCurrent employee information:")
-            headers = [
-                "ID", "First Name", "Last Name", "Email", "Phone",
-                "Department", "Position", "Salary", "Hire Date"
-            ]
-            print(tabulate(
-                employee,
-                headers=headers,
-                tablefmt="grid",
-                colalign=(
-                    "center",  # ID
-                    "left",    # First Name
-                    "left",    # Last Name
-                    "left",    # Email
-                    "center",  # Phone
-                    "left",    # Department
-                    "left",    # Position
-                    "right",   # Salary
-                    "center"   # Hire Date
-                ),
-                numalign="center"
-            ))
+            print_employees(employee)
             
             print("\nEnter new information (press Enter to keep current value):")
             
@@ -391,7 +372,10 @@ class EmployeeManagement:
             # Department
             department = input(f"Department [{current_values['department']}]: ").strip()
             if department:
-                new_values['department'] = department
+                if department in DEPT_PREFIX:
+                    new_values['department'] = department
+                else:
+                    print("Invalid department. Keeping current value.")
             
             # Position
             position = input(f"Position [{current_values['position']}]: ").strip()
@@ -403,10 +387,10 @@ class EmployeeManagement:
             if salary_input:
                 try:
                     salary = float(salary_input)
-                    if salary > 0:
+                    if 0 < salary < 100_000_000 and math.isfinite(salary):
                         new_values['salary'] = salary
                     else:
-                        print("Salary must be greater than 0. Keeping current value.")
+                        print("Salary must be greater than 0 and less than $100,000,000. Keeping current value.")
                 except ValueError:
                     print("Invalid salary format. Keeping current value.")
             
@@ -454,48 +438,14 @@ class EmployeeManagement:
             emp_id = input("Enter employee ID to delete: ").strip()
             
             # First check if employee exists
-            check_query = """
-                SELECT 
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone,
-                    department,
-                    position,
-                    CONCAT('$', FORMAT(salary, 2)) as salary,
-                    DATE_FORMAT(hire_date, '%Y-%m-%d') as hire_date
-                FROM employees 
-                WHERE id = %s
-            """
-            employee = self.execute_query(check_query, (emp_id,))
+            employee = self.fetch_employee(emp_id)
             
             if not employee:
                 print("Employee not found!")
                 return
             
             print("\nEmployee to be deleted:")
-            headers = [
-                "ID", "First Name", "Last Name", "Email", "Phone",
-                "Department", "Position", "Salary", "Hire Date"
-            ]
-            print(tabulate(
-                employee,
-                headers=headers,
-                tablefmt="grid",
-                colalign=(
-                    "center",  # ID
-                    "left",    # First Name
-                    "left",    # Last Name
-                    "left",    # Email
-                    "center",  # Phone
-                    "left",    # Department
-                    "left",    # Position
-                    "right",   # Salary
-                    "center"   # Hire Date
-                ),
-                numalign="center"
-            ))
+            print_employees(employee)
             
             confirm = input("\nAre you sure you want to delete this employee? (yes/no): ").strip().lower()
             if confirm == 'yes':
@@ -513,59 +463,28 @@ class EmployeeManagement:
             emp_id = input("Enter employee ID to promote: ").strip()
             
             # First check if employee exists
-            check_query = """
-                SELECT 
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone,
-                    department,
-                    position,
-                    CONCAT('$', FORMAT(salary, 2)) as salary,
-                    DATE_FORMAT(hire_date, '%Y-%m-%d') as hire_date
-                FROM employees 
-                WHERE id = %s
-            """
-            employee = self.execute_query(check_query, (emp_id,))
+            employee = self.fetch_employee(emp_id)
             
             if not employee:
                 print("Employee not found!")
                 return
             
             print("\nCurrent employee information:")
-            headers = [
-                "ID", "First Name", "Last Name", "Email", "Phone",
-                "Department", "Position", "Salary", "Hire Date"
-            ]
-            print(tabulate(
-                employee,
-                headers=headers,
-                tablefmt="grid",
-                colalign=(
-                    "center",  # ID
-                    "left",    # First Name
-                    "left",    # Last Name
-                    "left",    # Email
-                    "center",  # Phone
-                    "left",    # Department
-                    "left",    # Position
-                    "right",   # Salary
-                    "center"   # Hire Date
-                ),
-                numalign="center"
-            ))
+            print_employees(employee)
             
             print("\nEnter new position and salary:")
             new_position = input("New position: ").strip()
-            
+            if not new_position:
+                print("Position cannot be empty.")
+                return
+
             while True:
                 try:
                     new_salary = float(input("New salary: $"))
-                    if new_salary > 0:
+                    if 0 < new_salary < 100_000_000 and math.isfinite(new_salary):
                         break
                     else:
-                        print("Salary must be greater than 0.")
+                        print("Salary must be greater than 0 and less than $100,000,000.")
                 except ValueError:
                     print("Please enter a valid number.")
             
@@ -588,8 +507,8 @@ class EmployeeManagement:
         try:
             print("\n=== Export Database State ===")
             
-            # Use the existing file name
-            filename = "employee_management.sql"
+            # Export to a separate backup file so the seed SQL stays intact
+            filename = Path(__file__).parent / "backup_employee_management.sql"
             
             # Get all employees
             query = """
@@ -600,7 +519,10 @@ class EmployeeManagement:
                 ORDER BY department, id
             """
             employees = self.execute_query(query)
-            
+            if employees is None:
+                print("Could not read employee data. Backup was not created.")
+                return
+
             with open(filename, 'w', encoding='utf-8') as f:
                 # Write header
                 f.write("-- Employee Management System Database\n")
@@ -634,8 +556,9 @@ class EmployeeManagement:
                     
                     for i, emp in enumerate(employees):
                         values = (
-                            f"('{emp[0]}', '{emp[1]}', '{emp[2]}', '{emp[3]}', '{emp[4]}', "
-                            f"'{emp[5]}', '{emp[6]}', {emp[7]}, '{emp[8]}')"
+                            f"({sql_str(emp[0])}, {sql_str(emp[1])}, {sql_str(emp[2])}, "
+                            f"{sql_str(emp[3])}, {sql_str(emp[4])}, {sql_str(emp[5])}, "
+                            f"{sql_str(emp[6])}, {emp[7]}, {sql_str(emp[8])})"
                         )
                         if i < len(employees) - 1:
                             f.write(f"{values},\n")
@@ -659,46 +582,10 @@ SELECT
     MAX(salary) as max_salary
 FROM employees
 GROUP BY department;\n\n""")
-                
-                # Write stored procedures
-                f.write("-- Create stored procedures\n")
-                f.write("""DELIMITER //
-CREATE PROCEDURE promote_employee(
-    IN emp_id VARCHAR(3),
-    IN new_position VARCHAR(50),
-    IN new_salary DECIMAL(10, 2)
-)
-BEGIN
-    UPDATE employees 
-    SET position = new_position,
-        salary = new_salary
-    WHERE id = emp_id;
-END //
-DELIMITER ;\n\n""")
-
-                f.write("""DELIMITER //
-CREATE PROCEDURE search_employees(
-    IN search_term VARCHAR(100)
-)
-BEGIN
-    SELECT *
-    FROM employees
-    WHERE first_name LIKE CONCAT('%', search_term, '%')
-    OR last_name LIKE CONCAT('%', search_term, '%')
-    OR email LIKE CONCAT('%', search_term, '%')
-    OR department LIKE CONCAT('%', search_term, '%')
-    OR position LIKE CONCAT('%', search_term, '%');
-END //
-DELIMITER ;\n\n""")
-                
-                # Write user privileges
-                f.write("-- Set up user privileges\n")
-                f.write("CREATE USER IF NOT EXISTS 'employee_user'@'localhost' IDENTIFIED BY 'your_password';\n")
-                f.write("GRANT ALL PRIVILEGES ON employee_management.* TO 'employee_user'@'localhost';\n")
-                f.write("FLUSH PRIVILEGES;\n")
             
+
             print(f"\nDatabase state exported successfully to: {filename}")
-            print("The SQL file has been updated with the current database state.")
+            print("Backup written. The seed file employee_management.sql is unchanged.")
             
         except Error as e:
             print(f"Error exporting database state: {e}")
@@ -720,7 +607,10 @@ DELIMITER ;\n\n""")
                     CONCAT('$', FORMAT(SUM(salary), 2)) as total_salary
                 FROM employees
             """
-            overall_stats = self.execute_query(overall_query)[0]
+            overall = self.execute_query(overall_query)
+            if not overall:
+                return
+            overall_stats = overall[0]
             
             print("\nOverall Salary Statistics:")
             print("=" * 50)
@@ -743,7 +633,7 @@ DELIMITER ;\n\n""")
                 GROUP BY department
                 ORDER BY AVG(salary) DESC
             """
-            dept_stats = self.execute_query(dept_query)
+            dept_stats = self.execute_query(dept_query) or []
             
             print("\nDepartment-wise Salary Analysis:")
             print("=" * 80)
@@ -767,7 +657,7 @@ DELIMITER ;\n\n""")
                 GROUP BY position
                 ORDER BY AVG(salary) DESC
             """
-            position_stats = self.execute_query(position_query)
+            position_stats = self.execute_query(position_query) or []
             
             print("\nPosition-wise Salary Analysis:")
             print("=" * 80)
@@ -784,10 +674,10 @@ DELIMITER ;\n\n""")
                 SELECT 
                     CASE 
                         WHEN salary < 50000 THEN 'Under $50,000'
-                        WHEN salary BETWEEN 50000 AND 75000 THEN '$50,000 - $75,000'
-                        WHEN salary BETWEEN 75001 AND 100000 THEN '$75,001 - $100,000'
-                        WHEN salary BETWEEN 100001 AND 150000 THEN '$100,001 - $150,000'
-                        ELSE 'Over $150,000'
+                        WHEN salary < 75000 THEN '$50,000 - $74,999.99'
+                        WHEN salary < 100000 THEN '$75,000 - $99,999.99'
+                        WHEN salary < 150000 THEN '$100,000 - $149,999.99'
+                        ELSE '$150,000 and over'
                     END as salary_range,
                     COUNT(*) as employee_count,
                     CONCAT('$', FORMAT(AVG(salary), 2)) as avg_salary
@@ -795,7 +685,7 @@ DELIMITER ;\n\n""")
                 GROUP BY salary_range
                 ORDER BY MIN(salary)
             """
-            range_stats = self.execute_query(range_query)
+            range_stats = self.execute_query(range_query) or []
             
             print("\nSalary Range Distribution:")
             print("=" * 60)
@@ -812,6 +702,8 @@ DELIMITER ;\n\n""")
 
 def main():
     try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         emp_management = EmployeeManagement()
         
         while True:
